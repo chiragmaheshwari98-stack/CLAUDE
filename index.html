@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VCP Swing Trader — Angel One Live</title>
+<!-- Entry point for static hosting (GitHub Pages / Netlify / Vercel / Cloudflare).
+     Forwards the clean root URL to the app file so the site works at "/". -->
+<meta http-equiv="refresh" content="0; url=./vcp_swing_trader_angelone.html">
+<link rel="canonical" href="./vcp_swing_trader_angelone.html">
+<style>
+  html,body{margin:0;height:100%;background:#060a0f;color:#00d4ff;
+    font-family:system-ui,Segoe UI,Roboto,sans-serif;}
+  .wrap{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;}
+  .logo{font-weight:900;letter-spacing:3px;font-size:22px;text-shadow:0 0 22px rgba(0,212,255,.5);}
+  .sub{color:#5a7a9a;font-size:13px;letter-spacing:1px;}
+  a{color:#00e676;text-decoration:none;border-bottom:1px solid rgba(0,230,118,.4);}
+  .spin{width:34px;height:34px;border:3px solid rgba(0,212,255,.2);border-top-color:#00d4ff;
+    border-radius:50%;animation:s .8s linear infinite;}
+  @keyframes s{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="logo">VCP&nbsp;⚡&nbsp;SWING TRADER</div>
+    <div class="spin"></div>
+    <div class="sub">Loading the dashboard…</div>
+    <div class="sub">If it doesn't open, <a href="./vcp_swing_trader_angelone.html">click here</a>.</div>
+  </div>
+  <script>
+    // Belt-and-suspenders: redirect via JS too (in case meta refresh is blocked).
+    location.replace('./vcp_swing_trader_angelone.html');
+  </script>
+</body>
+</html>
