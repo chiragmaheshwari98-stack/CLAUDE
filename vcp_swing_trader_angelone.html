@@ -295,6 +295,8 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       <div class="hint">Angel One blocks direct browser calls (CORS). Use one of:<br>
         • <b>Local:</b> run <code>node angel-cors-proxy.js</code> → enter <code>http://localhost:8080/</code><br>
         • <b>Hosted (Vercel/Netlify/Cloudflare):</b> enter <code>https://your-app.vercel.app/api/proxy?url={url}</code> — keep the literal <code>{url}</code>; it is replaced with the encoded target. Leave blank for DEMO mode.</div>
+      <button type="button" class="demo-btn" style="margin-top:8px" onclick="testProxy()">🔍 Test Proxy Connection</button>
+      <div id="proxyTestResult" style="font-size:11px;margin-top:6px;line-height:1.5"></div>
     </div>
     <button class="btn-connect" id="btnConnect" onclick="connectAngelOne()">⚡ CONNECT ANGEL ONE</button>
     <hr class="modal-divider"/>
@@ -716,11 +718,62 @@ async function connectAngelOne() {
     runScan();
 
   } catch(e) {
-    errEl.textContent = `❌ ${e.message}`;
+    if (/failed to fetch|networkerror|load failed/i.test(e.message)) {
+      errEl.innerHTML = '❌ <b>Failed to fetch</b> — the app could not reach your CORS proxy.<br>'
+        + '• Click <b>🔍 Test Proxy</b> below to pinpoint the cause.<br>'
+        + '• <b>Vercel:</b> make sure PR #1 is merged & deployed so <code>/api/proxy</code> exists, and keep the literal <code>{url}</code> in the prefix.<br>'
+        + '• <b>Local proxy:</b> ensure <code>node angel-cors-proxy.js</code> is running, and don\'t open this page over HTTPS (mixed content is blocked).';
+    } else {
+      errEl.textContent = `❌ ${e.message}`;
+    }
     errEl.classList.add('show');
     btn.disabled = false;
     btn.textContent = '⚡ CONNECT ANGEL ONE';
     setApiStatus('disconnected', 'CONNECT API');
+  }
+}
+
+/* ─── Proxy connectivity self-test — turns a vague "Failed to fetch"
+   into an actionable diagnosis without needing valid credentials. ─── */
+async function testProxy() {
+  const el = document.getElementById('proxyTestResult');
+  const v  = document.getElementById('f_proxyUrl').value.trim();
+  if (!el) return;
+  if (!v) { el.style.color = 'var(--yellow)'; el.innerHTML = '⚠ Enter a proxy prefix first (or leave blank for DEMO mode).'; return; }
+  if (!/^https?:\/\//i.test(v)) { el.style.color = 'var(--red)'; el.innerHTML = '❌ Prefix must start with <code>http://</code> or <code>https://</code>.'; return; }
+  if (location.protocol === 'https:' && /^http:\/\//i.test(v)) {
+    el.style.color = 'var(--red)';
+    el.innerHTML = '❌ This page is HTTPS but the proxy is HTTP (localhost). Browsers block that (mixed content).<br>Use the HTTPS Vercel proxy here, or open the app over http/file:// for a local proxy.';
+    return;
+  }
+  if (v.indexOf('your-app') !== -1) {
+    el.style.color = 'var(--red)';
+    el.innerHTML = '❌ Replace the placeholder <code>your-app</code> with your real Vercel app name.';
+    return;
+  }
+  el.style.color = 'var(--yellow)'; el.innerHTML = '⏳ Testing proxy connection…';
+
+  const prev = angelSession.corsPrefix;
+  angelSession.corsPrefix = v;
+  const testUrl = proxify('https://apiconnect.angelone.in/');
+  try {
+    const r = await fetch(testUrl, { method: 'GET' });
+    if (r.status === 404) {
+      el.style.color = 'var(--yellow)';
+      el.innerHTML = '⚠ Reached the host but got <b>404</b>. The <code>/api/proxy</code> function is likely not deployed yet — merge PR #1 and redeploy on Vercel.';
+    } else {
+      el.style.color = 'var(--green)';
+      el.innerHTML = `✅ Proxy reachable (HTTP ${r.status}). Live data should work — enter your credentials and Connect.`;
+    }
+  } catch(e) {
+    el.style.color = 'var(--red)';
+    const base = (v.split('?')[0]) || v;
+    el.innerHTML = '❌ <b>Could not reach the proxy.</b><br>'
+      + '1) Open <code>' + base + '</code> in a new browser tab — if it shows 404/NOT_FOUND, the proxy isn\'t deployed (merge PR #1).<br>'
+      + '2) Confirm the URL is exactly right (Vercel app name, and the literal <code>{url}</code> kept).<br>'
+      + '3) Local proxy must be running: <code>node angel-cors-proxy.js</code>.';
+  } finally {
+    angelSession.corsPrefix = prev; // restore; real Connect re-sets it from the field
   }
 }
 
