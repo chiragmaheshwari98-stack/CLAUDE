@@ -291,8 +291,10 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
     </div>
     <div class="form-row">
       <label>CORS Proxy Prefix (required for live data in browser)</label>
-      <input type="text" id="f_proxyUrl" placeholder="e.g. http://localhost:8080/  (cors-anywhere prefix)"/>
-      <div class="hint">Angel One blocks direct browser calls (CORS). Enter your proxy <b>prefix</b> — the full Angel URL is appended to it. Run <code>npx cors-anywhere</code> on port 8080, then use <code>http://localhost:8080/</code>. Leave blank only for DEMO mode.</div>
+      <input type="text" id="f_proxyUrl" placeholder="e.g. http://localhost:8080/  OR  https://your-app.vercel.app/api/proxy?url={url}"/>
+      <div class="hint">Angel One blocks direct browser calls (CORS). Use one of:<br>
+        • <b>Local:</b> run <code>node angel-cors-proxy.js</code> → enter <code>http://localhost:8080/</code><br>
+        • <b>Hosted (Vercel/Netlify/Cloudflare):</b> enter <code>https://your-app.vercel.app/api/proxy?url={url}</code> — keep the literal <code>{url}</code>; it is replaced with the encoded target. Leave blank for DEMO mode.</div>
     </div>
     <button class="btn-connect" id="btnConnect" onclick="connectAngelOne()">⚡ CONNECT ANGEL ONE</button>
     <hr class="modal-divider"/>
@@ -534,11 +536,16 @@ const QUOTE_THROTTLE_MS = 1100;
 // Small sleep helper for throttling API calls
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-// Build a CORS-proxied URL. The proxy field is treated as a prefix (cors-anywhere style):
-// e.g. prefix "http://localhost:8080/" + "https://apiconnect.angelone.in/rest/..."
+// Build a CORS-proxied URL. Two supported styles:
+//  1. Append (local proxy):   prefix "http://localhost:8080/"  -> prefix + "/" + targetURL
+//  2. Placeholder (hosted):   prefix ".../api/proxy?url={url}"  -> {url} replaced with the
+//     URL-encoded target. Use this for serverless proxies (Vercel/Netlify/Cloudflare),
+//     which is robust because the full target travels as a single encoded query value.
 function proxify(fullUrl){
   const p = angelSession && angelSession.corsPrefix;
-  return p ? (p.replace(/\/+$/,'') + '/' + fullUrl) : fullUrl;
+  if (!p) return fullUrl;
+  if (p.indexOf('{url}') !== -1) return p.replace('{url}', encodeURIComponent(fullUrl));
+  return p.replace(/\/+$/,'') + '/' + fullUrl;
 }
 
 // Angel One instrument tokens for popular stocks
