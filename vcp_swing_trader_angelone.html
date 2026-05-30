@@ -792,33 +792,58 @@ function aoHeaders() {
   };
 }
 
+/* ─── Live-data error surfacing (so failures are NEVER silent) ─── */
+let lastQuoteError = '';
+let liveErrShown = false;
+
+async function aoPostJSON(endpoint, body) {
+  const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${endpoint}`), {
+    method: 'POST', headers: aoHeaders(), body: JSON.stringify(body)
+  });
+  const text = await resp.text();
+  let data = null;
+  try { data = JSON.parse(text); }
+  catch(e) {
+    throw new Error(`Non-JSON response (HTTP ${resp.status}). The proxy likely returned an error page — confirm it is deployed and the prefix is correct.`);
+  }
+  if (data && data.status === false) {
+    throw new Error(data.message || data.errorcode || `Angel API error (HTTP ${resp.status})`);
+  }
+  return data;
+}
+
+function reportLiveError(where, msg) {
+  lastQuoteError = msg;
+  console.error(`[VCP live] ${where} failed: ${msg}`);
+  if (!liveErrShown) {
+    liveErrShown = true;
+    showNotif(`⚠ Live data error: ${msg}`, 'err');
+    const st = document.getElementById('scanTxt');
+    if (st) st.textContent = `⚠ Live fetch failed: ${msg}`;
+  }
+}
+
 /* ─── Angel One: Fetch index quotes ─── */
 async function fetchIndexQuotes() {
   if (!angelSession.connected) return;
   try {
-    const body = {
+    const data = await aoPostJSON(ANGEL_API.QUOTE, {
       mode: 'FULL',
       exchangeTokens: {
         // Modern index tokens in the Angel One scrip master
         NSE: ['99926000','99926009','99926037'],  // Nifty 50, Nifty Bank, Nifty IT
         BSE: ['99919000'],                         // Sensex
       }
-    };
-    const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.QUOTE}`), {
-      method: 'POST', headers: aoHeaders(), body: JSON.stringify(body)
     });
-    const data = await resp.json();
-    if (data.status && data.data) {
-      const fetched = data.data.fetched || [];
-      fetched.forEach(q => {
-        const t = q.symbolToken;
-        if (t === '99926000') updateIndexUI('nifty', q.ltp, q.percentChange);
-        if (t === '99926009') updateIndexUI('banknifty', q.ltp, q.percentChange);
-        if (t === '99926037') updateIndexUI('niftyit', q.ltp, q.percentChange);
-        if (t === '99919000') updateIndexUI('sensex', q.ltp, q.percentChange);
-      });
-    }
-  } catch(e) { /* Silently keep last values */ }
+    const fetched = (data && data.data && data.data.fetched) || [];
+    fetched.forEach(q => {
+      const t = q.symbolToken;
+      if (t === '99926000') updateIndexUI('nifty', q.ltp, q.percentChange);
+      if (t === '99926009') updateIndexUI('banknifty', q.ltp, q.percentChange);
+      if (t === '99926037') updateIndexUI('niftyit', q.ltp, q.percentChange);
+      if (t === '99919000') updateIndexUI('sensex', q.ltp, q.percentChange);
+    });
+  } catch(e) { reportLiveError('Index quotes', e.message); }
 }
 
 /* ─── Angel One: Fetch OHLC candle data ─── */
@@ -832,11 +857,8 @@ async function fetchCandleData(sym, exchange, token, interval, fromDate, toDate)
     todate: toDate,
   };
   try {
-    const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.CANDLE}`), {
-      method: 'POST', headers: aoHeaders(), body: JSON.stringify(body)
-    });
-    const data = await resp.json();
-    if (data.status && data.data) {
+    const data = await aoPostJSON(ANGEL_API.CANDLE, body);
+    if (data && data.data) {
       // Angel One candle format: [timestamp, open, high, low, close, volume]
       return data.data.map(c => ({
         open:   parseFloat(c[1]),
@@ -847,7 +869,7 @@ async function fetchCandleData(sym, exchange, token, interval, fromDate, toDate)
         time:   c[0]
       }));
     }
-  } catch(e) {}
+  } catch(e) { console.error(`[VCP live] candle ${sym}: ${e.message}`); }
   return null;
 }
 
@@ -874,22 +896,16 @@ async function fetchBatchLTP(tokenMap, onProgress) {
     chunk.forEach(c => { (em[c.ex] = em[c.ex] || []).push(c.token); });
 
     try {
-      const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.QUOTE}`), {
-        method: 'POST',
-        headers: aoHeaders(),
-        body: JSON.stringify({ mode: 'FULL', exchangeTokens: em })
+      const data = await aoPostJSON(ANGEL_API.QUOTE, { mode: 'FULL', exchangeTokens: em });
+      const fetched = (data && data.data && data.data.fetched) || [];
+      fetched.forEach(q => {
+        result[q.symbolToken] = {
+          ltp: parseFloat(q.ltp),
+          chg: parseFloat(q.percentChange != null ? q.percentChange : 0),
+          vol: parseInt(q.tradeVolume != null ? q.tradeVolume : (q.tradedVolume || 0))
+        };
       });
-      const data = await resp.json();
-      if (data && data.status && data.data) {
-        (data.data.fetched || []).forEach(q => {
-          result[q.symbolToken] = {
-            ltp: parseFloat(q.ltp),
-            chg: parseFloat(q.percentChange != null ? q.percentChange : 0),
-            vol: parseInt(q.tradeVolume != null ? q.tradeVolume : (q.tradedVolume || 0))
-          };
-        });
-      }
-    } catch(e) { /* keep going on partial failure */ }
+    } catch(e) { reportLiveError('Quote fetch', e.message); }
 
     done += chunk.length;
     if (typeof onProgress === 'function') onProgress(done, total);
@@ -1487,20 +1503,32 @@ async function runScan() {
 
   // If live, pre-fetch REAL batch LTP (chunked 50/req, throttled 1/sec)
   if (angelSession.mode==='live') {
+    liveErrShown = false; lastQuoteError = '';
+    const mkt = getMarketStatus();
+    if (mkt.status !== 'open') {
+      showNotif(`ℹ Market ${mkt.label} — showing last traded prices (they won't tick until the market opens).`);
+    }
     const nseT=[], bseT=[];
     eligible.forEach(s => { if(s.ex==='NSE') nseT.push(s.token); else bseT.push(s.token); });
     const ltpMap = await fetchBatchLTP({NSE:nseT,BSE:bseT}, (done,total) => {
       document.getElementById('progFill').style.width = (done/total*100)+'%';
       document.getElementById('scanTxt').textContent = `📡 Fetching live Angel One rates... ${done}/${total}`;
     }).catch(()=>({}));
+    let fetchedCount = 0;
     Object.entries(ltpMap).forEach(([token,d]) => {
       const st = tokenStock[String(token)];
       if (st && liveData[st.sym] && d.ltp) {
-        liveData[st.sym].prevClose = liveData[st.sym].prevClose || d.ltp;
+        liveData[st.sym].prevClose = d.ltp;
         liveData[st.sym].price = d.ltp;
         liveData[st.sym].chg   = d.chg;
+        fetchedCount++;
       }
     });
+    if (fetchedCount > 0) {
+      showNotif(`📡 Live rates received for ${fetchedCount}/${eligible.length} stocks`, 'sig');
+    } else if (!liveErrShown) {
+      reportLiveError('Quote fetch', 'No prices returned — check tokens/credentials, or the market data API entitlement on your Angel account.');
+    }
   }
 
   let i=0;
