@@ -290,9 +290,9 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       </div>
     </div>
     <div class="form-row">
-      <label>Local Secret (for CORS proxy — optional)</label>
-      <input type="text" id="f_proxyUrl" placeholder="http://localhost:5050 (leave blank if running direct)"/>
-      <div class="hint">Angel One API blocks direct browser calls. Run the bundled proxy server or leave blank for demo mode.</div>
+      <label>CORS Proxy Prefix (required for live data in browser)</label>
+      <input type="text" id="f_proxyUrl" placeholder="e.g. http://localhost:8080/  (cors-anywhere prefix)"/>
+      <div class="hint">Angel One blocks direct browser calls (CORS). Enter your proxy <b>prefix</b> — the full Angel URL is appended to it. Run <code>npx cors-anywhere</code> on port 8080, then use <code>http://localhost:8080/</code>. Leave blank only for DEMO mode.</div>
     </div>
     <button class="btn-connect" id="btnConnect" onclick="connectAngelOne()">⚡ CONNECT ANGEL ONE</button>
     <hr class="modal-divider"/>
@@ -405,6 +405,33 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
         <button class="tb-btn active" id="btnBSE" onclick="toggleEx(this)">BSE</button>
       </div>
       <div class="tb-grp">
+        <span class="tb-lbl">Universe</span>
+        <select class="tb-sel" id="univSel" onchange="onUniverseChange()">
+          <option value="curated">Curated (~70)</option>
+          <option value="full">Full NSE Cash</option>
+        </select>
+        <span style="font-size:9px;color:var(--muted)" id="univCount">70</span>
+      </div>
+      <div class="tb-grp">
+        <span class="tb-lbl">Scan</span>
+        <select class="tb-sel" id="scanLimitSel">
+          <option value="100">Top 100</option>
+          <option value="250" selected>Top 250</option>
+          <option value="500">Top 500</option>
+          <option value="999999">All</option>
+        </select>
+      </div>
+      <div class="tb-grp">
+        <span class="tb-lbl">Auto-Refresh</span>
+        <button class="tb-btn" id="autoRefBtn" onclick="toggleAutoRefresh()">OFF</button>
+        <select class="tb-sel" id="refIntSel" onchange="onRefIntChange()">
+          <option value="5">5s</option>
+          <option value="10" selected>10s</option>
+          <option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
+      </div>
+      <div class="tb-grp">
         <span class="tb-lbl">Data</span>
         <span class="data-src-tag demo" id="dataSrcTag">DEMO</span>
       </div>
@@ -416,6 +443,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
       <span id="scanTxt">Ready — click ⚡ SCAN VCP to begin</span>
       <div class="prog-track"><div class="prog-fill" id="progFill" style="width:0%"></div></div>
       <span style="color:var(--accent);font-weight:700;font-size:10px" id="progCount"></span>
+      <span style="margin-left:auto;font-weight:700;font-size:10px" id="refreshCountdown"></span>
     </div>
 
     <!-- CHART + DETAIL -->
@@ -496,6 +524,23 @@ const ANGEL_API = {
 // Angel One exchange codes
 const AO_EXCHANGE = { NSE: 'NSE', BSE: 'BSE' };
 
+// Full instrument master (all NSE/BSE/MCX scrips) — used to load the FULL NSE cash segment
+const SCRIP_MASTER_URL = 'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json';
+
+// Quote API limits (Angel One): max 50 tokens / request, 1 request / second
+const QUOTE_BATCH = 50;
+const QUOTE_THROTTLE_MS = 1100;
+
+// Small sleep helper for throttling API calls
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+// Build a CORS-proxied URL. The proxy field is treated as a prefix (cors-anywhere style):
+// e.g. prefix "http://localhost:8080/" + "https://apiconnect.angelone.in/rest/..."
+function proxify(fullUrl){
+  const p = angelSession && angelSession.corsPrefix;
+  return p ? (p.replace(/\/+$/,'') + '/' + fullUrl) : fullUrl;
+}
+
 // Angel One instrument tokens for popular stocks
 // Full list: https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json
 const INSTRUMENT_TOKENS = {
@@ -547,6 +592,7 @@ let angelSession = {
   clientId: null,
   apiKey: null,
   proxyUrl: null,
+  corsPrefix: null,
   ws: null,
   wsSubscribed: [],
 };
@@ -611,11 +657,12 @@ async function connectAngelOne() {
   btn.textContent = '⟳ CONNECTING...';
   setApiStatus('connecting', 'CONNECTING...');
 
-  const base = proxyUrl || ANGEL_API.BASE_URL;
+  // Treat the proxy field as a CORS prefix (cors-anywhere style)
+  angelSession.corsPrefix = proxyUrl || null;
   const payload = { clientcode: clientId, password, totp };
 
   try {
-    const resp = await fetch(`${base}${ANGEL_API.LOGIN}`, {
+    const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.LOGIN}`), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -650,9 +697,14 @@ async function connectAngelOne() {
     closeLoginModal();
     showNotif(`✅ Angel One connected as ${clientId}`, 'sig');
 
+    // Stop demo simulation so it never overwrites real rates
+    if (demoInterval) { clearInterval(demoInterval); demoInterval = null; }
+
     // Start WebSocket & fetch indices
     initAngelWS();
     fetchIndexQuotes();
+    // Turn auto-refresh ON automatically for live data
+    if (!autoRefreshOn) toggleAutoRefresh();
     // Auto-scan with live data
     runScan();
 
@@ -685,13 +737,14 @@ async function fetchIndexQuotes() {
   if (!angelSession.connected) return;
   try {
     const body = {
-      mode: 'LTP',
+      mode: 'FULL',
       exchangeTokens: {
-        NSE: ['26000','26009','26074'],
-        BSE: ['1'],
+        // Modern index tokens in the Angel One scrip master
+        NSE: ['99926000','99926009','99926037'],  // Nifty 50, Nifty Bank, Nifty IT
+        BSE: ['99919000'],                         // Sensex
       }
     };
-    const resp = await fetch(`${angelSession.proxyUrl}${ANGEL_API.QUOTE}`, {
+    const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.QUOTE}`), {
       method: 'POST', headers: aoHeaders(), body: JSON.stringify(body)
     });
     const data = await resp.json();
@@ -699,12 +752,13 @@ async function fetchIndexQuotes() {
       const fetched = data.data.fetched || [];
       fetched.forEach(q => {
         const t = q.symbolToken;
-        if (t === '26000') updateIndexUI('nifty', q.ltp, q.percentChange);
-        if (t === '26009') updateIndexUI('banknifty', q.ltp, q.percentChange);
-        if (t === '1')     updateIndexUI('sensex', q.ltp, q.percentChange);
+        if (t === '99926000') updateIndexUI('nifty', q.ltp, q.percentChange);
+        if (t === '99926009') updateIndexUI('banknifty', q.ltp, q.percentChange);
+        if (t === '99926037') updateIndexUI('niftyit', q.ltp, q.percentChange);
+        if (t === '99919000') updateIndexUI('sensex', q.ltp, q.percentChange);
       });
     }
-  } catch(e) { /* Silently fallback to demo values */ }
+  } catch(e) { /* Silently keep last values */ }
 }
 
 /* ─── Angel One: Fetch OHLC candle data ─── */
@@ -718,7 +772,7 @@ async function fetchCandleData(sym, exchange, token, interval, fromDate, toDate)
     todate: toDate,
   };
   try {
-    const resp = await fetch(`${angelSession.proxyUrl}${ANGEL_API.CANDLE}`, {
+    const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.CANDLE}`), {
       method: 'POST', headers: aoHeaders(), body: JSON.stringify(body)
     });
     const data = await resp.json();
@@ -737,24 +791,53 @@ async function fetchCandleData(sym, exchange, token, interval, fromDate, toDate)
   return null;
 }
 
-/* ─── Angel One: Fetch live LTP for stock list ─── */
-async function fetchBatchLTP(tokenMap) {
-  // tokenMap = { NSE: ['2885','1333',...], BSE: [...] }
+/* ─── Angel One: Fetch live quotes for stock list (chunked + throttled) ───
+   Angel One /quote allows max 50 tokens per request @ 1 req/sec.
+   tokenMap = { NSE: ['2885','1333',...], BSE: [...] }
+   onProgress(done,total) is optional. Returns { token: {ltp, chg, vol} } */
+async function fetchBatchLTP(tokenMap, onProgress) {
   if (!angelSession.connected) return {};
-  try {
-    const resp = await fetch(`${angelSession.proxyUrl}${ANGEL_API.QUOTE}`, {
-      method: 'POST',
-      headers: aoHeaders(),
-      body: JSON.stringify({ mode: 'LTP', exchangeTokens: tokenMap })
-    });
-    const data = await resp.json();
-    if (!data.status) return {};
-    const result = {};
-    (data.data.fetched || []).forEach(q => {
-      result[q.symbolToken] = { ltp: q.ltp, chg: q.percentChange, vol: q.tradedVolume };
-    });
-    return result;
-  } catch(e) { return {}; }
+
+  // Flatten into [{ex, token}] preserving exchange
+  const flat = [];
+  Object.entries(tokenMap || {}).forEach(([ex, toks]) => {
+    (toks || []).forEach(t => { if (t) flat.push({ ex, token: String(t) }); });
+  });
+
+  const result = {};
+  const total = flat.length;
+  let done = 0;
+
+  for (let i = 0; i < flat.length; i += QUOTE_BATCH) {
+    const chunk = flat.slice(i, i + QUOTE_BATCH);
+    const em = {};
+    chunk.forEach(c => { (em[c.ex] = em[c.ex] || []).push(c.token); });
+
+    try {
+      const resp = await fetch(proxify(`${ANGEL_API.BASE_URL}${ANGEL_API.QUOTE}`), {
+        method: 'POST',
+        headers: aoHeaders(),
+        body: JSON.stringify({ mode: 'FULL', exchangeTokens: em })
+      });
+      const data = await resp.json();
+      if (data && data.status && data.data) {
+        (data.data.fetched || []).forEach(q => {
+          result[q.symbolToken] = {
+            ltp: parseFloat(q.ltp),
+            chg: parseFloat(q.percentChange != null ? q.percentChange : 0),
+            vol: parseInt(q.tradeVolume != null ? q.tradeVolume : (q.tradedVolume || 0))
+          };
+        });
+      }
+    } catch(e) { /* keep going on partial failure */ }
+
+    done += chunk.length;
+    if (typeof onProgress === 'function') onProgress(done, total);
+
+    // Respect the 1 request / second rate limit between chunks
+    if (i + QUOTE_BATCH < flat.length) await sleep(QUOTE_THROTTLE_MS);
+  }
+  return result;
 }
 
 /* ─── Angel One: WebSocket SmartStream ─── */
@@ -829,10 +912,12 @@ const tokenToSym = {};
 Object.entries(INSTRUMENT_TOKENS).forEach(([sym, t]) => { tokenToSym[t.token] = sym; });
 
 /* ═══════════════════════════════════════════════════════
-   STOCK UNIVERSE — NSE/BSE MCap ≥ ₹3000 Cr
+   STOCK UNIVERSE — NSE/BSE MCap ≥ ₹3000 Cr (curated default)
+   Use the "Full NSE Cash" universe selector to load the
+   entire NSE equity (-EQ) segment from the Angel One master.
    ═══════════════════════════════════════════════════════ */
 
-const STOCKS = [
+let STOCKS = [
   {sym:'RELIANCE',  ex:'NSE',mcap:1950000,sector:'Energy',      name:'Reliance Industries', token:'2885'},
   {sym:'TCS',       ex:'NSE',mcap:1420000,sector:'IT',           name:'TCS',                 token:'11536'},
   {sym:'HDFCBANK',  ex:'NSE',mcap:1200000,sector:'Banking',      name:'HDFC Bank',           token:'1333'},
@@ -904,6 +989,11 @@ const STOCKS = [
   {sym:'GODREJCP',  ex:'NSE',mcap:95000,  sector:'FMCG',         name:'Godrej Consumer',     token:'10099'},
 ];
 
+// Keep an immutable copy of the curated list so we can switch back from Full NSE
+const CURATED_STOCKS = STOCKS.slice();
+let FULL_STOCKS = null;          // populated once Full NSE Cash is loaded
+let fullUniverseLoaded = false;
+
 /* ═══════════════════════════════════════════════════════
    LIVE DATA STORE — populated by Angel One API or demo sim
    ═══════════════════════════════════════════════════════ */
@@ -955,20 +1045,122 @@ function generateCandles(base, n) {
   return bars;
 }
 
+/* Ensure liveData + priceHistory exist for a stock (needed when the
+   Full NSE universe introduces symbols not in the curated list). */
+function ensureStockData(s) {
+  if (!liveData[s.sym]) {
+    const base = DEMO_PRICES[s.sym] || 500;
+    liveData[s.sym] = {
+      price: parseFloat((base).toFixed(2)),
+      chg: 0,
+      prevClose: base
+    };
+  }
+  if (!priceHistory[s.sym]) {
+    priceHistory[s.sym] = generateCandles(liveData[s.sym].price, 120);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════
+   FULL NSE CASH SEGMENT LOADER
+   Pulls the Angel One scrip master and keeps every NSE
+   equity (-EQ) instrument — the entire cash segment.
+   ═══════════════════════════════════════════════════════ */
+async function loadFullNSEUniverse() {
+  if (fullUniverseLoaded && FULL_STOCKS) { STOCKS = FULL_STOCKS.slice(); return STOCKS.length; }
+
+  showNotif('⏳ Loading FULL NSE cash segment from Angel One scrip master...');
+  document.getElementById('scanTxt').textContent = '⏳ Downloading Angel One scrip master (full NSE cash segment)...';
+
+  // Try a CORS-proxied URL first (if a proxy prefix is set), then direct.
+  const urls = [];
+  if (angelSession.corsPrefix) urls.push(proxify(SCRIP_MASTER_URL));
+  urls.push(SCRIP_MASTER_URL);
+
+  let master = null;
+  for (const u of urls) {
+    try {
+      const r = await fetch(u, { method: 'GET' });
+      if (r.ok) { master = await r.json(); break; }
+    } catch(e) { /* try next */ }
+  }
+
+  if (!Array.isArray(master)) {
+    showNotif('❌ Could not load scrip master (CORS). Use a proxy prefix, then retry.', 'err');
+    document.getElementById('scanTxt').textContent = '❌ Full universe load failed — set a CORS proxy prefix in the login modal and retry.';
+    // Revert selector back to curated
+    document.getElementById('univSel').value = 'curated';
+    return 0;
+  }
+
+  // Filter for NSE equity cash segment: symbol "XYZ-EQ", instrumenttype empty
+  const seen = new Set();
+  const list = [];
+  master.forEach(row => {
+    const sym = row.symbol || '';
+    const it  = (row.instrumenttype || '').trim();
+    if (row.exch_seg === 'NSE' && it === '' && sym.endsWith('-EQ')) {
+      const clean = sym.replace(/-EQ$/, '');
+      if (seen.has(row.token)) return;
+      seen.add(row.token);
+      list.push({
+        sym: clean,
+        ex: 'NSE',
+        mcap: 0,                 // unknown for the full segment → mcap filter is skipped
+        sector: 'NSE Cash',
+        name: row.name || clean,
+        token: String(row.token)
+      });
+    }
+  });
+
+  list.sort((a,b) => a.sym.localeCompare(b.sym));
+  FULL_STOCKS = list;
+  fullUniverseLoaded = true;
+  STOCKS = FULL_STOCKS.slice();
+
+  // Lazily create demo placeholders so the UI works before live LTP arrives
+  STOCKS.forEach(ensureStockData);
+
+  showNotif(`✅ Full NSE cash segment loaded — ${STOCKS.length} stocks`, 'sig');
+  return STOCKS.length;
+}
+
+/* Toolbar: switch between curated and full NSE universe */
+async function onUniverseChange() {
+  const v = document.getElementById('univSel').value;
+  const cntEl = document.getElementById('univCount');
+  if (v === 'full') {
+    const n = await loadFullNSEUniverse();
+    if (n > 0) cntEl.textContent = n.toLocaleString('en-IN');
+    else cntEl.textContent = CURATED_STOCKS.length;
+  } else {
+    STOCKS = CURATED_STOCKS.slice();
+    cntEl.textContent = STOCKS.length;
+    showNotif(`Universe: curated ${STOCKS.length} stocks`);
+    document.getElementById('scanTxt').textContent = `Ready — curated universe (${STOCKS.length} stocks). Click ⚡ SCAN VCP.`;
+  }
+}
+
 /* Demo price simulation (when not connected to Angel One) */
 let demoInterval = null;
 function startDemoSim() {
   if (demoInterval) clearInterval(demoInterval);
   demoInterval = setInterval(() => {
     if (angelSession.mode === 'live') return;
-    STOCKS.forEach(s => {
-      const d = liveData[s.sym];
+    // Only tick the symbols currently shown (keeps Full-NSE universe snappy in demo)
+    const syms = allSignals.length ? allSignals.map(s => s.sym) : CURATED_STOCKS.slice(0,60).map(s => s.sym);
+    syms.forEach(sym => {
+      const d = liveData[sym];
+      if (!d) return;
       const m = (Math.random()-0.4975)*0.006;
       d.price = parseFloat((d.price*(1+m)).toFixed(2));
       d.chg = parseFloat(((d.price - d.prevClose)/d.prevClose*100).toFixed(2));
-      const bars = priceHistory[s.sym];
-      const last = bars[bars.length-1];
-      last.close = d.price; last.high = Math.max(last.high,d.price); last.low = Math.min(last.low,d.price);
+      const bars = priceHistory[sym];
+      if (bars && bars.length) {
+        const last = bars[bars.length-1];
+        last.close = d.price; last.high = Math.max(last.high,d.price); last.low = Math.min(last.low,d.price);
+      }
     });
     // update active signal price
     if (activeSignal) updateActiveChart();
@@ -1208,24 +1400,46 @@ async function runScan() {
   allSignals = [];
   renderSigList([]);
 
-  const eligible = STOCKS.filter(s => {
+  const scanLimit = parseInt((document.getElementById('scanLimitSel')||{}).value || '999999');
+
+  let eligible = STOCKS.filter(s => {
     const cr = Math.floor(s.mcap/100);
-    if (cr < mcapMin) return false;
+    // mcap filter only applies when mcap is known (curated list); full NSE has mcap=0
+    if (s.mcap > 0 && cr < mcapMin) return false;
     if (s.ex==='NSE'&&!nseOn) return false;
     if (s.ex==='BSE'&&!bseOn) return false;
     return true;
   });
 
-  document.getElementById('scanTxt').textContent = `Scanning ${eligible.length} stocks for VCP...`;
+  // Cap the scan size (matters for the Full NSE universe of ~2000 stocks)
+  const totalEligible = eligible.length;
+  if (eligible.length > scanLimit) eligible = eligible.slice(0, scanLimit);
 
-  // If live, pre-fetch batch LTP
+  // Make sure every stock to be scanned has a data slot
+  eligible.forEach(ensureStockData);
+
+  // Fast token -> stock lookup (avoids O(n^2) on the full universe)
+  const tokenStock = {};
+  STOCKS.forEach(s => { tokenStock[String(s.token)] = s; });
+
+  document.getElementById('scanTxt').textContent =
+    `Scanning ${eligible.length}${eligible.length<totalEligible?` of ${totalEligible}`:''} stocks for VCP...`;
+
+  // If live, pre-fetch REAL batch LTP (chunked 50/req, throttled 1/sec)
   if (angelSession.mode==='live') {
     const nseT=[], bseT=[];
     eligible.forEach(s => { if(s.ex==='NSE') nseT.push(s.token); else bseT.push(s.token); });
-    const ltpMap = await fetchBatchLTP({NSE:nseT,BSE:bseT}).catch(()=>({}));
+    const ltpMap = await fetchBatchLTP({NSE:nseT,BSE:bseT}, (done,total) => {
+      document.getElementById('progFill').style.width = (done/total*100)+'%';
+      document.getElementById('scanTxt').textContent = `📡 Fetching live Angel One rates... ${done}/${total}`;
+    }).catch(()=>({}));
     Object.entries(ltpMap).forEach(([token,d]) => {
-      const sym = STOCKS.find(s=>s.token===token)?.sym;
-      if (sym && liveData[sym]) { liveData[sym].price=d.ltp; liveData[sym].chg=d.chg; }
+      const st = tokenStock[String(token)];
+      if (st && liveData[st.sym] && d.ltp) {
+        liveData[st.sym].prevClose = liveData[st.sym].prevClose || d.ltp;
+        liveData[st.sym].price = d.ltp;
+        liveData[st.sym].chg   = d.chg;
+      }
     });
   }
 
@@ -1265,7 +1479,8 @@ async function runScan() {
     const sig = generateSignal(stock);
     if (sig) allSignals.push(sig);
     i++;
-    setTimeout(next, angelSession.mode==='live'?40:6);
+    // Live historical-candle API allows ~3 req/sec → space requests; demo is instant
+    setTimeout(next, angelSession.mode==='live'?350:6);
   }
   await next();
 }
@@ -1686,6 +1901,7 @@ function startDemoMode(){
     showNotif('▶ Demo mode active — using simulated data. Click CONNECT API for live data.');
     startDemoSim();
     updateDemoIndices();
+    if (!autoRefreshOn) toggleAutoRefresh();
     runScan();
   },400);
 }
@@ -1701,52 +1917,127 @@ function showNotif(msg,cls=''){
    WebSocket unavailable or as fallback)
    ═══════════════════════════════════════════════════════ */
 
-let livePollInterval = null;
-function startLivePoll() {
-  if (livePollInterval) clearInterval(livePollInterval);
-  livePollInterval = setInterval(async () => {
-    if (angelSession.mode !== 'live') return;
-    // Batch LTP for all signals
-    if (allSignals.length === 0) return;
-    const nseT=[], bseT=[];
-    allSignals.forEach(s=>{if(s.ex==='NSE')nseT.push(s.token);else bseT.push(s.token);});
-    const ltpMap = await fetchBatchLTP({NSE:nseT,BSE:bseT}).catch(()=>({}));
-    Object.entries(ltpMap).forEach(([token,d])=>{
-      const sym = STOCKS.find(s=>s.token===token)?.sym;
-      if (sym){liveData[sym].price=d.ltp;liveData[sym].chg=d.chg;updateLiveDisplay(sym,d.ltp);}
-    });
-    // Refresh index quotes every 5 polls
-    if (Math.random()<0.2) fetchIndexQuotes();
-  }, 3000);
+/* ═══════════════════════════════════════════════════════
+   AUTO-REFRESH ENGINE
+   Live  → re-fetches REAL Angel One rates for displayed signals
+   Demo  → refreshes the simulated tape + indices
+   Visible countdown shown in the scan bar.
+   ═══════════════════════════════════════════════════════ */
+
+let autoRefreshOn = false;
+let autoRefreshBusy = false;
+let countdownTimer = null;
+let nextRefreshAt = 0;
+
+function autoRefreshIntervalMs(){
+  return (parseInt((document.getElementById('refIntSel')||{}).value) || 10) * 1000;
+}
+
+function toggleAutoRefresh(){
+  autoRefreshOn = !autoRefreshOn;
+  const b = document.getElementById('autoRefBtn');
+  if (autoRefreshOn){
+    b.textContent = 'ON'; b.classList.add('active');
+    startAutoRefresh();
+    showNotif(`🔄 Auto-refresh ON · every ${autoRefreshIntervalMs()/1000}s`, 'sig');
+  } else {
+    b.textContent = 'OFF'; b.classList.remove('active');
+    stopAutoRefresh();
+    document.getElementById('refreshCountdown').textContent = '';
+    showNotif('⏸ Auto-refresh OFF');
+  }
+}
+
+function onRefIntChange(){
+  if (autoRefreshOn){ stopAutoRefresh(); startAutoRefresh(); }
+}
+
+function startAutoRefresh(){
+  stopAutoRefresh();
+  nextRefreshAt = Date.now() + autoRefreshIntervalMs();
+  countdownTimer = setInterval(tickCountdown, 250);
+}
+
+function stopAutoRefresh(){
+  if (countdownTimer){ clearInterval(countdownTimer); countdownTimer = null; }
+}
+
+async function tickCountdown(){
+  if (!autoRefreshOn) return;
+  const cd = document.getElementById('refreshCountdown');
+  if (autoRefreshBusy){ return; }
+  const remain = Math.max(0, nextRefreshAt - Date.now());
+  cd.style.color = angelSession.mode==='live' ? 'var(--green)' : 'var(--orange)';
+  cd.textContent = `🔄 ${angelSession.mode==='live'?'LIVE':'DEMO'} refresh in ${Math.ceil(remain/1000)}s`;
+  if (remain <= 0){
+    autoRefreshBusy = true;
+    cd.textContent = '🔄 Refreshing rates...';
+    try { await doAutoRefresh(); } catch(e){}
+    autoRefreshBusy = false;
+    nextRefreshAt = Date.now() + autoRefreshIntervalMs();
+  }
+}
+
+async function doAutoRefresh(){
+  if (angelSession.mode === 'live'){
+    // Pull REAL Angel One rates for indices + every displayed signal
+    fetchIndexQuotes();
+    if (allSignals.length){
+      const nseT=[], bseT=[];
+      allSignals.forEach(s => { if(s.ex==='NSE') nseT.push(s.token); else bseT.push(s.token); });
+      const ltpMap = await fetchBatchLTP({NSE:nseT, BSE:bseT}).catch(()=>({}));
+      const tokenStock = {}; STOCKS.forEach(s => { tokenStock[String(s.token)] = s; });
+      Object.entries(ltpMap).forEach(([token,d]) => {
+        const st = tokenStock[String(token)];
+        if (st && liveData[st.sym] && d.ltp){
+          liveData[st.sym].price = d.ltp;
+          liveData[st.sym].chg   = d.chg;
+          updateLiveDisplay(st.sym, d.ltp);
+        }
+      });
+    }
+    if (activeSignal){
+      updateActiveChart();
+      if (priceChart && liveData[activeSignal.sym]){
+        const ds = priceChart.data.datasets[0];
+        ds.data[ds.data.length-1] = liveData[activeSignal.sym].price;
+        priceChart.update('none');
+      }
+    }
+  } else {
+    // Demo: the tape ticks via startDemoSim; refresh the visible figures
+    updateDemoIndices();
+    allSignals.forEach(sig => refreshSigCardPrice(sig));
+    if (activeSignal) updateActiveChart();
+  }
 }
 
 /* ═══════════════════════════════════════════════════════
    PROXY SERVER NOTE — shown in console
    ═══════════════════════════════════════════════════════ */
 console.log(`
-╔══════════════════════════════════════════════════════════╗
-║         VCP SWING TRADER — ANGEL ONE API GUIDE          ║
-╠══════════════════════════════════════════════════════════╣
-║  Angel One SmartAPI requires a CORS proxy for browser   ║
-║  usage. You can run one easily with Node.js:            ║
-║                                                          ║
-║  Option 1: Use the bundled proxy (Node.js)               ║
-║  ─────────────────────────────────────────────────────  ║
-║  npm install -g cors-anywhere                            ║
-║  cors-anywhere --port 5050                               ║
-║  Then enter http://localhost:5050/https://apiconnect... ║
-║  in the Proxy URL field in the login modal               ║
-║                                                          ║
-║  Option 2: Deploy as Node/Python backend API             ║
-║  Use the Angel One Python library:                       ║
-║  pip install smartapi-python                             ║
-║  Build a FastAPI/Flask wrapper around it                 ║
-║                                                          ║
-║  Option 3: Electron desktop app (no CORS issues)         ║
-║  Package this HTML in Electron to call Angel API direct  ║
-║                                                          ║
-║  Official Docs: https://smartapi.angelbroking.com/docs   ║
-╚══════════════════════════════════════════════════════════╝
+══════════════════════════════════════════════════════════════
+  VCP SWING TRADER — ANGEL ONE LIVE DATA GUIDE
+══════════════════════════════════════════════════════════════
+  Browsers block direct calls to Angel One (CORS), so live
+  rates need a small CORS proxy. Treat the proxy field as a
+  PREFIX — the full Angel URL is appended to whatever you type.
+
+  Quick start (cors-anywhere):
+    npx cors-anywhere            # starts on http://localhost:8080
+  Then in the login modal:
+    CORS Proxy Prefix = http://localhost:8080/
+
+  What you get when connected (mode = LIVE):
+    • Real LTP/quotes from Angel One  /quote  (50 tokens/req, 1 req/s)
+    • Full NSE cash segment via the scrip master:
+      ${SCRIP_MASTER_URL}
+    • Auto-refresh re-pulls real rates on your chosen interval
+
+  Alternatives: deploy a FastAPI/Flask wrapper around
+  smartapi-python, or package this file in Electron (no CORS).
+  Docs: https://smartapi.angelbroking.com/docs
+══════════════════════════════════════════════════════════════
 `);
 
 /* ═══════════════════════════════════════════════════════
@@ -1769,9 +2060,10 @@ window.onload = function() {
   setTimeout(()=>{
     document.getElementById('loadOverlay').classList.add('hidden');
     setInterval(updateClock,1000); updateClock();
+    const uc = document.getElementById('univCount'); if (uc) uc.textContent = CURATED_STOCKS.length;
     // Auto-show login modal after short delay
     setTimeout(openLoginModal, 600);
-    startLivePoll();
+    // Auto-refresh is started automatically on live connect / demo start
   },2800);
 };
 </script>
